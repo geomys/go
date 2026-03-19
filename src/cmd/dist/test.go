@@ -717,31 +717,34 @@ func (t *tester) registerTests() {
 		runTests: "^$", // only ensure they compile
 	})
 
-	// Check that all crypto packages compile (and test correctly, in longmode) with fips.
-	if t.fipsSupported() {
+	// Check that all crypto packages compile (and test correctly, in longmode) with GOFIPS140.
+	if t.fipsSupported("latest") {
 		// Test standard crypto packages with fips140=on.
 		t.registerTest("GOFIPS140=latest go test crypto/...", &goTest{
 			variant: "gofips140",
-			env:     []string{"GOFIPS140=latest"},
-			pkg:     "crypto/...",
+			// GODEBUG=fips140wasmentropy=bypass makes wasm/js tests work.
+			env: []string{"GOFIPS140=latest", "GODEBUG=fips140wasmentropy=bypass"},
+			pkg: "crypto/...",
 		})
-
-		// Test that earlier FIPS snapshots build.
-		// In long mode, test that they work too.
-		for _, version := range fipsVersions(t.short) {
-			suffix := " # (build and vet only)"
-			run := "^$" // only ensure they compile
-			if !t.short {
-				suffix = ""
-				run = ""
-			}
-			t.registerTest("GOFIPS140="+version+" go test crypto/..."+suffix, &goTest{
-				variant:  "gofips140-" + version,
-				pkg:      "crypto/...",
-				runTests: run,
-				env:      []string{"GOFIPS140=" + version, "GOMODCACHE=" + filepath.Join(workdir, "fips-"+version)},
-			})
+	}
+	// Test that earlier FIPS snapshots build.
+	// In long mode, test that they work too.
+	for _, version := range fipsVersions(t.short) {
+		if !t.fipsSupported(version) {
+			continue
 		}
+		suffix := " # (build and vet only)"
+		run := "^$" // only ensure they compile
+		if !t.short {
+			suffix = ""
+			run = ""
+		}
+		t.registerTest("GOFIPS140="+version+" go test crypto/..."+suffix, &goTest{
+			variant:  "gofips140-" + version,
+			pkg:      "crypto/...",
+			runTests: run,
+			env:      []string{"GOFIPS140=" + version, "GOMODCACHE=" + filepath.Join(workdir, "fips-"+version)},
+		})
 	}
 
 	// Test GOEXPERIMENT=jsonv2.
@@ -1838,7 +1841,7 @@ func isEnvSet(evar string) bool {
 	return false
 }
 
-func (t *tester) fipsSupported() bool {
+func (t *tester) fipsSupported(version string) bool {
 	// Keep this in sync with [crypto/internal/fips140.Supported].
 
 	// We don't test with the purego tag, so no need to check it.
@@ -1848,12 +1851,9 @@ func (t *tester) fipsSupported() bool {
 		return false
 	}
 
-	// If this goos/goarch does not support FIPS at all, return no versions.
-	// The logic here matches crypto/internal/fips140/check.Supported for now.
-	// In the future, if some snapshots add support for these, we will have
-	// to make a decision on a per-version basis.
 	switch {
-	case goarch == "wasm",
+	// wasm/js partially works on latest with GODEBUG=fips140wasmentropy=bypass.
+	case goarch == "wasm" && (goos != "js" || version != "latest"),
 		goos == "windows" && goarch == "386",
 		goos == "openbsd",
 		goos == "aix":

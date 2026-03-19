@@ -68,7 +68,7 @@ var (
 
 	flagOutfile    = flag.String("o", "", "write output to `file`")
 	flagPluginPath = flag.String("pluginpath", "", "full path name for plugin")
-	flagFipso      = flag.String("fipso", "", "write fips module to `file`")
+	FlagFipso      = flag.String("fipso", "", "write fips module to `file`")
 
 	flagInstallSuffix = flag.String("installsuffix", "", "set package directory `suffix`")
 	flagDumpDep       = flag.Bool("dumpdep", false, "dump symbol dependency graph")
@@ -424,6 +424,9 @@ func Main(arch *sys.Arch, theArch Arch) {
 	ctxt.textaddress()
 	bench.Start("typelink")
 	ctxt.typelink()
+	if ctxt.IsWasm() {
+		wasmFips(ctxt)
+	}
 	bench.Start("buildinfo")
 	ctxt.buildinfo()
 	bench.Start("pclntab")
@@ -470,7 +473,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 		thearch.GenSymsLate(ctxt, ctxt.loader)
 	}
 
-	asmbfips(ctxt, *flagFipso)
+	asmbfips(ctxt, *FlagFipso)
 
 	bench.Start("Asmb2")
 	asmb2(ctxt)

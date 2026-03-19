@@ -117,9 +117,13 @@ func TestIntegrityCheckInfo(t *testing.T) {
 			t.Errorf("checktest.%s (%#x) not in section #%d (%#x..%#x)", name, p, i, s.Start, s.End)
 		}
 	}
-	sect(0, "TEXT", unsafe.Pointer(abi.FuncPCABIInternal(checktest.TEXT)))
-	if p := checktest.PtrStaticText(); p != nil {
-		sect(0, "StaticText", p)
+	if runtime.GOARCH != "wasm" {
+		// Our scheme for POST on webassembly does not have a 1-to-1 correspondence of function
+		// pointer to spot between the 2 pointers given in the FIPS object
+		sect(0, "TEXT", unsafe.Pointer(abi.FuncPCABIInternal(checktest.TEXT)))
+		if p := checktest.PtrStaticText(); p != nil {
+			sect(0, "StaticText", p)
+		}
 	}
 	sect(1, "RODATA", unsafe.Pointer(&checktest.RODATA))
 	sect(2, "NOPTRDATA", unsafe.Pointer(&checktest.NOPTRDATA))

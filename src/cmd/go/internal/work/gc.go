@@ -605,6 +605,12 @@ func (gcToolchain) ld(b *Builder, root *Action, targetPath, importcfg, mainpkg s
 		ldflags = append(ldflags, "-pluginpath", pluginPath(root))
 	}
 	if fips140.Enabled() {
+		// fipso tells the linker to dump a file for the sources it used to
+		// construct the fipsinfo object for FIPS140-3 POST, but it also lets us
+		// know that a build is intended for turning on FIPS support. wasm/js
+		// FIPS support has a runtime overhead and since most programs don't
+		// need it, the linker switches on whether it emits the right buffers
+		// for it on this flag.
 		ldflags = append(ldflags, "-fipso", filepath.Join(root.Objdir, "fips.o"))
 	}
 
