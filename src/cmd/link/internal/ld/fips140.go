@@ -117,29 +117,31 @@ import (
 
 const enableFIPS = true
 
-// fipsSyms are the special FIPS section bracketing symbols.
-var fipsSyms = []struct {
-	name string
-	kind sym.SymKind
-	sym  loader.Sym
-	seg  *sym.Segment
+// FIPSSyms are the special FIPS section bracketing symbols.
+var FIPSSyms = []struct {
+	Name string
+	Kind sym.SymKind
+	Sym  loader.Sym
+	Seg  *sym.Segment
 }{
-	{name: "go:textfipsstart", kind: sym.STEXTFIPSSTART, seg: &Segtext},
-	{name: "go:textfipsend", kind: sym.STEXTFIPSEND},
-	{name: "go:rodatafipsstart", kind: sym.SRODATAFIPSSTART, seg: &Segrodata},
-	{name: "go:rodatafipsend", kind: sym.SRODATAFIPSEND},
-	{name: "go:noptrdatafipsstart", kind: sym.SNOPTRDATAFIPSSTART, seg: &Segdata},
-	{name: "go:noptrdatafipsend", kind: sym.SNOPTRDATAFIPSEND},
-	{name: "go:datafipsstart", kind: sym.SDATAFIPSSTART, seg: &Segdata},
-	{name: "go:datafipsend", kind: sym.SDATAFIPSEND},
+	{Name: "go:textfipsstart", Kind: sym.STEXTFIPSSTART, Seg: &Segtext},
+	{Name: "go:textfipsend", Kind: sym.STEXTFIPSEND},
+	{Name: "go:rodatafipsstart", Kind: sym.SRODATAFIPSSTART, Seg: &Segrodata},
+	{Name: "go:rodatafipsend", Kind: sym.SRODATAFIPSEND},
+	{Name: "go:noptrdatafipsstart", Kind: sym.SNOPTRDATAFIPSSTART, Seg: &Segdata},
+	{Name: "go:noptrdatafipsend", Kind: sym.SNOPTRDATAFIPSEND},
+	{Name: "go:datafipsstart", Kind: sym.SDATAFIPSSTART, Seg: &Segdata},
+	{Name: "go:datafipsend", Kind: sym.SDATAFIPSEND},
 }
 
 // fipsinfo is the loader symbol for go:fipsinfo.
 var fipsinfo loader.Sym
 
+var FipsTextBuffer loader.Sym
+
 const (
 	fipsMagic    = "\xff Go fipsinfo \xff\x00"
-	fipsMagicLen = 16
+	FIPSMagicLen = 16
 	fipsSumLen   = 32
 )
 
@@ -153,26 +155,39 @@ func loadfips(ctxt *Link) {
 	}
 	// Write the fipsinfo symbol, which crypto/internal/fips140/check uses.
 	ldr := ctxt.loader
+
+	// Wasm uses an alternate way of verifying the text bytestream. See [wasmFips] and cmd/link/internal/wasm.asmbfips
+	if ctxt.IsWasm() {
+		FIPSSyms[0].Seg = &Segdata
+		FIPSSyms[0].Kind = sym.SNOPTRBSS
+		FIPSSyms[1].Kind = sym.SNOPTRBSS
+
+	}
 	// TODO lock down linkname
 	info := ldr.CreateSymForUpdate("go:fipsinfo", 0)
 	info.SetType(sym.SFIPSINFO)
 
-	data := make([]byte, fipsMagicLen+fipsSumLen)
+	data := make([]byte, FIPSMagicLen+fipsSumLen)
 	copy(data, fipsMagic)
 	info.SetData(data)
 	info.SetSize(int64(len(data)))      // magic + checksum, to be filled in
 	info.AddAddr(ctxt.Arch, info.Sym()) // self-reference
 
-	for i := range fipsSyms {
-		s := &fipsSyms[i]
-		sb := ldr.CreateSymForUpdate(s.name, 0)
-		sb.SetType(s.kind)
+	for i := range FIPSSyms {
+		s := &FIPSSyms[i]
+		sb := ldr.CreateSymForUpdate(s.Name, 0)
+		sb.SetType(s.Kind)
 		sb.SetLocal(true)
 		sb.SetSize(1)
-		s.sym = sb.Sym()
-		info.AddAddr(ctxt.Arch, s.sym)
-		if s.kind == sym.STEXTFIPSSTART || s.kind == sym.STEXTFIPSEND {
-			ctxt.Textp = append(ctxt.Textp, s.sym)
+		s.Sym = sb.Sym()
+		// Grab the start symbol for the shadow text.
+		// we will change the size later in [wasmFips]
+		if s.Name == "go:textfipsstart" {
+			FipsTextBuffer = s.Sym
+		}
+		info.AddAddr(ctxt.Arch, s.Sym)
+		if s.Kind == sym.STEXTFIPSSTART || s.Kind == sym.STEXTFIPSEND {
+			ctxt.Textp = append(ctxt.Textp, s.Sym)
 		}
 	}
 
@@ -182,7 +197,6 @@ func loadfips(ctxt *Link) {
 // fipsObj calculates the fips object hash and optionally writes
 // the hashed content to a file for debugging.
 type fipsObj struct {
-	r   io.ReaderAt
 	w   io.Writer
 	wf  *os.File
 	h   hash.Hash
@@ -192,8 +206,8 @@ type fipsObj struct {
 // newFipsObj creates a fipsObj reading from r and writing to fipso
 // (unless fipso is the empty string, in which case it writes nowhere
 // and only computes the hash).
-func newFipsObj(r io.ReaderAt, fipso string) (*fipsObj, error) {
-	f := &fipsObj{r: r}
+func newFipsObj(fipso string) (*fipsObj, error) {
+	f := new(fipsObj)
 	f.h = hmac.New(sha256.New, make([]byte, 32))
 	f.w = f.h
 	if fipso != "" {
@@ -215,11 +229,11 @@ func newFipsObj(r io.ReaderAt, fipso string) (*fipsObj, error) {
 // addSection adds the section of r (passed to newFipsObj)
 // starting at byte offset start and ending before byte offset end
 // to the fips object file.
-func (f *fipsObj) addSection(start, end int64) error {
+func (f *fipsObj) addSection(r io.ReaderAt, start, end int64) error {
 	n := end - start
 	binary.BigEndian.PutUint64(f.tmp[:], uint64(n))
 	f.w.Write(f.tmp[:])
-	_, err := io.Copy(f.w, io.NewSectionReader(f.r, start, n))
+	_, err := io.Copy(f.w, io.NewSectionReader(r, start, n))
 	return err
 }
 
@@ -247,39 +261,46 @@ func asmbfips(ctxt *Link, fipso string) {
 	if ctxt.LinkMode == LinkExternal {
 		return
 	}
+	// wasm has its own fips assembly function. See wasmFips below
+	// and asmbfips in cmd/link/internal/wasm for more info
+	if ctxt.IsWasm() {
+		return
+	}
 	if ctxt.BuildMode == BuildModePlugin { // not sure why this doesn't work
 		return
 	}
 
 	// Create a new FIPS object with data read from our output file.
-	f, err := newFipsObj(bytes.NewReader(ctxt.Out.Data()), fipso)
-	if err != nil {
-		Errorf("asmbfips: %v", err)
-		return
-	}
-	defer f.Close()
+	out := bytes.NewReader(ctxt.Out.Data())
+	secs := make([]*FipsSection, 0, len(FIPSSyms)/2)
 
 	// Add the FIPS sections to the FIPS object.
 	ldr := ctxt.loader
-	for i := 0; i < len(fipsSyms); i += 2 {
-		start := &fipsSyms[i]
-		end := &fipsSyms[i+1]
-		startAddr := ldr.SymValue(start.sym)
-		endAddr := ldr.SymValue(end.sym)
-		seg := start.seg
+	for i := 0; i < len(FIPSSyms); i += 2 {
+		start := &FIPSSyms[i]
+		end := &FIPSSyms[i+1]
+		startAddr := ldr.SymValue(start.Sym)
+		endAddr := ldr.SymValue(end.Sym)
+		seg := start.Seg
 		if seg.Vaddr == 0 && seg == &Segrodata { // some systems use text instead of separate rodata
 			seg = &Segtext
 		}
 		base := int64(seg.Fileoff - seg.Vaddr)
 		if !(seg.Vaddr <= uint64(startAddr) && startAddr <= endAddr && uint64(endAddr) <= seg.Vaddr+seg.Filelen) {
-			Errorf("asmbfips: %s not in expected segment (%#x..%#x not in %#x..%#x)", start.name, startAddr, endAddr, seg.Vaddr, seg.Vaddr+seg.Filelen)
+			Errorf("asmbfips: %s not in expected segment (%#x..%#x not in %#x..%#x)", start.Name, startAddr, endAddr, seg.Vaddr, seg.Vaddr+seg.Filelen)
 			return
 		}
+		secs = append(secs, &FipsSection{
+			Section: out,
+			Start:   startAddr + base,
+			End:     endAddr + base,
+		})
 
-		if err := f.addSection(startAddr+base, endAddr+base); err != nil {
-			Errorf("asmbfips: %v", err)
-			return
-		}
+	}
+	sum, err := FipsSum(secs, fipso)
+	if err != nil {
+		Errorf("asmbfips: %v", err)
+		return
 	}
 
 	// Overwrite the go:fipsinfo sum field with the calculated sum.
@@ -289,13 +310,30 @@ func asmbfips(ctxt *Link, fipso string) {
 		Errorf("asmbfips: fipsinfo not in expected segment (%#x..%#x not in %#x..%#x)", addr, addr+32, seg.Vaddr, seg.Vaddr+seg.Filelen)
 		return
 	}
-	ctxt.Out.SeekSet(int64(seg.Fileoff + addr - seg.Vaddr + fipsMagicLen))
-	ctxt.Out.Write(f.sum())
+	ctxt.Out.SeekSet(int64(seg.Fileoff + addr - seg.Vaddr + FIPSMagicLen))
+	ctxt.Out.Write(sum)
 
-	if err := f.Close(); err != nil {
-		Errorf("asmbfips: %v", err)
-		return
+}
+
+type FipsSection struct {
+	Section io.ReaderAt
+	Start   int64
+	End     int64
+}
+
+func FipsSum(sections []*FipsSection, fipso string) ([]byte, error) {
+	f, err := newFipsObj(fipso)
+	if err != nil {
+		return nil, err
 	}
+	defer f.Close()
+	for _, s := range sections {
+		err := f.addSection(s.Section, s.Start, s.End)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return f.sum(), nil
 }
 
 // hostlinkfips is called from [hostlink] to update go:fipsinfo
@@ -339,12 +377,6 @@ func machofips(ctxt *Link, exe, fipso string) error {
 	}
 	defer wf.Close()
 
-	f, err := newFipsObj(wf, fipso)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	// Find the go:fipsinfo symbol.
 	sect := mf.Section("__go_fipsinfo")
 	if sect == nil {
@@ -374,28 +406,35 @@ func machofips(ctxt *Link, exe, fipso string) error {
 	// the data holds the actual pointers.
 	// This code handles both pie and non-pie binaries.
 	const addendMask = 1<<48 - 1
-	data = data[fipsMagicLen+fipsSumLen:]
+	data = data[FIPSMagicLen+fipsSumLen:]
 	self := int64(uptr(data)) & addendMask
 	base := int64(sect.Offset) - self
 	data = data[ctxt.Arch.PtrSize:]
 
+	secs := make([]*FipsSection, 4)
 	for i := 0; i < 4; i++ {
 		start := int64(uptr(data[0:]))&addendMask + base
 		end := int64(uptr(data[ctxt.Arch.PtrSize:]))&addendMask + base
 		data = data[2*ctxt.Arch.PtrSize:]
-		if err := f.addSection(start, end); err != nil {
-			return err
+		secs[i] = &FipsSection{
+			Section: wf,
+			Start:   start,
+			End:     end,
 		}
+	}
+	sum, err := FipsSum(secs, fipso)
+	if err != nil {
+		return err
 	}
 
 	// Overwrite the go:fipsinfo sum field with the calculated sum.
-	if _, err := wf.WriteAt(f.sum(), int64(sect.Offset)+fipsMagicLen); err != nil {
+	if _, err := wf.WriteAt(sum, int64(sect.Offset)+FIPSMagicLen); err != nil {
 		return err
 	}
 	if err := wf.Close(); err != nil {
 		return err
 	}
-	return f.Close()
+	return nil
 }
 
 // elffips updates go:fipsinfo after external linking
@@ -413,12 +452,6 @@ func elffips(ctxt *Link, exe, fipso string) error {
 		return err
 	}
 	defer wf.Close()
-
-	f, err := newFipsObj(wf, fipso)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 
 	// Find the go:fipsinfo symbol.
 	sect := ef.Section(".go.fipsinfo")
@@ -447,9 +480,10 @@ func elffips(ctxt *Link, exe, fipso string) error {
 	// For non-pie builds, there are no relocations at all:
 	// the data holds the actual pointers.
 	// This code handles both pie and non-pie binaries.
-	data = data[fipsMagicLen+fipsSumLen:]
+	data = data[FIPSMagicLen+fipsSumLen:]
 	data = data[ctxt.Arch.PtrSize:]
 
+	secs := make([]*FipsSection, 4)
 Addrs:
 	for i := 0; i < 4; i++ {
 		start := uptr(data[0:])
@@ -457,23 +491,29 @@ Addrs:
 		data = data[2*ctxt.Arch.PtrSize:]
 		for _, prog := range ef.Progs {
 			if prog.Type == elf.PT_LOAD && prog.Vaddr <= start && start <= end && end <= prog.Vaddr+prog.Filesz {
-				if err := f.addSection(int64(start+prog.Off-prog.Vaddr), int64(end+prog.Off-prog.Vaddr)); err != nil {
-					return err
+				secs[i] = &FipsSection{
+					Section: wf,
+					Start:   int64(start + prog.Off - prog.Vaddr),
+					End:     int64(end + prog.Off - prog.Vaddr),
 				}
 				continue Addrs
 			}
 		}
 		return fmt.Errorf("invalid pointers found in .go.fipsinfo")
 	}
+	sum, err := FipsSum(secs, fipso)
+	if err != nil {
+		return err
+	}
 
 	// Overwrite the go:fipsinfo sum field with the calculated sum.
-	if _, err := wf.WriteAt(f.sum(), int64(sect.Offset)+fipsMagicLen); err != nil {
+	if _, err := wf.WriteAt(sum, int64(sect.Offset)+FIPSMagicLen); err != nil {
 		return err
 	}
 	if err := wf.Close(); err != nil {
 		return err
 	}
-	return f.Close()
+	return nil
 }
 
 // pefips updates go:fipsinfo after external linking
@@ -492,12 +532,6 @@ func pefips(ctxt *Link, exe, fipso string) error {
 	}
 	defer wf.Close()
 
-	f, err := newFipsObj(wf, fipso)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	// Find the go:fipsinfo symbol.
 	// PE does not put it in its own section, so we have to scan for it.
 	// It is near the start of the data segment, right after go:buildinfo,
@@ -509,16 +543,16 @@ func pefips(ctxt *Link, exe, fipso string) error {
 	}
 	b := bufio.NewReader(sect.Open())
 	off := int64(0)
-	data := make([]byte, fipsMagicLen+fipsSumLen+9*ctxt.Arch.PtrSize)
+	data := make([]byte, FIPSMagicLen+fipsSumLen+9*ctxt.Arch.PtrSize)
 	for ; ; off += 16 {
 		if off >= maxScan {
 			break
 		}
-		if _, err := io.ReadFull(b, data[:fipsMagicLen]); err != nil {
+		if _, err := io.ReadFull(b, data[:FIPSMagicLen]); err != nil {
 			return fmt.Errorf("scanning PE for FIPS magic: %v", err)
 		}
-		if string(data[:fipsMagicLen]) == fipsMagic {
-			if _, err := io.ReadFull(b, data[fipsMagicLen:]); err != nil {
+		if string(data[:FIPSMagicLen]) == fipsMagic {
+			if _, err := io.ReadFull(b, data[FIPSMagicLen:]); err != nil {
 				return fmt.Errorf("scanning PE for FIPS magic: %v", err)
 			}
 			break
@@ -539,7 +573,7 @@ func pefips(ctxt *Link, exe, fipso string) error {
 	// For non-pie builds, there are no relocations at all:
 	// the data holds the actual pointers.
 	// This code handles both pie and non-pie binaries.
-	data = data[fipsMagicLen+fipsSumLen:]
+	data = data[FIPSMagicLen+fipsSumLen:]
 	self := int64(uptr(data))
 	data = data[ctxt.Arch.PtrSize:]
 
@@ -571,6 +605,7 @@ func pefips(ctxt *Link, exe, fipso string) error {
 	}
 	delta := peself - self
 
+	secs := make([]*FipsSection, 4)
 Addrs:
 	for i := 0; i < 4; i++ {
 		start := int64(uptr(data[0:])) + delta
@@ -579,21 +614,75 @@ Addrs:
 		for _, sect := range pf.Sections {
 			if int64(sect.VirtualAddress) <= start && start <= end && end <= int64(sect.VirtualAddress)+int64(sect.Size) {
 				off := int64(sect.Offset) - int64(sect.VirtualAddress)
-				if err := f.addSection(start+off, end+off); err != nil {
-					return err
+				secs[i] = &FipsSection{
+					Section: wf,
+					Start:   start + off,
+					End:     end + off,
 				}
 				continue Addrs
 			}
 		}
 		return fmt.Errorf("invalid pointers found in go:fipsinfo")
 	}
+	sum, err := FipsSum(secs, fipso)
+	if err != nil {
+		return err
+	}
 
 	// Overwrite the go:fipsinfo sum field with the calculated sum.
-	if _, err := wf.WriteAt(f.sum(), int64(sect.Offset)+off+fipsMagicLen); err != nil {
+	if _, err := wf.WriteAt(sum, int64(sect.Offset)+off+FIPSMagicLen); err != nil {
 		return err
 	}
 	if err := wf.Close(); err != nil {
 		return err
 	}
-	return f.Close()
+	return nil
+}
+
+func wasmFips(ctxt *Link) {
+	// The text bytestream needs to be hashed for FIPS140-3
+	// support. On other platforms, text gets loaded into the
+	// same memory space as data, but on Wasm, we can't inspect our
+	// own text. Instead, when a Wasm binary is loaded, we copy the text
+	// into a buffer that the verifying process can inspect.
+	//
+	// Allocating the buffer will change the offsets in the text
+	// stream, so we need to allocate it before we start writing
+	// out function bodies. Wasm relocations are variable sized,
+	// so we won't know how big the buffer will be until we start
+	// writing out bodies.
+	//
+	// Solve this chicken and egg problem by estimating the largest
+	// our FIPS text can be. When we get the actual data, we just
+	// leave the remainder as zeroes and hash those as well.
+	//
+	// TODO(dmo): we allocate the fips section last, so the offsets shouldn't
+	// change by it changing size after we write out the code segment. We might
+	// be able to use a buffer that's exactly right sized.
+
+	// The buffer does have some cost associated with it, so only construct it
+	// if we're building a binary with GOFIPS140 set. The go tool sets the fipso
+	// flag, so discover it via that.
+	if *FlagFipso == "" {
+		return
+	}
+
+	ldr := ctxt.loader
+	size := int64(0)
+	const maxUleb128Size = 10
+	for _, fn := range ctxt.Textp {
+		if ldr.SymType(fn) != sym.STEXTFIPS {
+			continue
+		}
+		// text
+		fnsize := int64(len(ldr.Data(fn)))
+		// index
+		fnsize += maxUleb128Size
+		// each relocation
+		relocs := ldr.Relocs(fn)
+		fnsize += int64(relocs.Count()) * maxUleb128Size
+		size += fnsize
+	}
+	up := ctxt.loader.MakeSymbolUpdater(FipsTextBuffer)
+	up.SetSize(size)
 }

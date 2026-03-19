@@ -12,11 +12,14 @@ import (
 	"cmd/link/internal/ld"
 	"cmd/link/internal/loader"
 	"cmd/link/internal/sym"
+	"cmp"
+	"encoding/binary"
 	"fmt"
 	"internal/abi"
 	"internal/buildcfg"
 	"io"
 	"regexp"
+	"slices"
 )
 
 const (
@@ -48,10 +51,11 @@ func gentext(ctxt *ld.Link, ldr *loader.Loader) {
 }
 
 type wasmFunc struct {
-	Module string
-	Name   string
-	Type   uint32
-	Code   []byte
+	Module    string
+	Name      string
+	Type      uint32
+	Code      []byte
+	isFips140 bool
 }
 
 type wasmFuncType struct {
@@ -116,8 +120,8 @@ func assignAddress(ldr *loader.Loader, sect *sym.Section, n int, s loader.Sym, v
 }
 
 type wasmDataSect struct {
-	sect *sym.Section
-	data []byte
+	vaddr uint64
+	data  []byte
 }
 
 var dataSects []wasmDataSect
@@ -137,7 +141,7 @@ func asmb(ctxt *ld.Link, ldr *loader.Loader) {
 	dataSects = make([]wasmDataSect, len(sections))
 	for i, sect := range sections {
 		data := ld.DatblkBytes(ctxt, int64(sect.Vaddr), int64(sect.Length))
-		dataSects[i] = wasmDataSect{sect, data}
+		dataSects[i] = wasmDataSect{sect.Vaddr, data}
 	}
 }
 
@@ -234,7 +238,7 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 		}
 
 		name := nameRegexp.ReplaceAllString(ldr.SymName(fn), "_")
-		fns[i] = &wasmFunc{Name: name, Type: typ, Code: wfn.Bytes()}
+		fns[i] = &wasmFunc{Name: name, Type: typ, Code: wfn.Bytes(), isFips140: ldr.SymType(fn) == sym.STEXTFIPS}
 	}
 
 	ctxt.Out.Write([]byte{0x00, 0x61, 0x73, 0x6d}) // magic
@@ -253,12 +257,108 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
 	writeGlobalSec(ctxt)
 	writeExportSec(ctxt, ldr, len(hostImports))
 	writeElementSec(ctxt, uint64(len(hostImports)), uint64(len(fns)))
-	writeCodeSec(ctxt, fns)
+	fipsbegin, fipsend := writeCodeSec(ctxt, fns)
+	asmbfips(ctxt, ldr, fipsbegin, fipsend)
+	writeFipsSection(ctxt, ldr, fipsbegin, fipsend)
 	writeDataSec(ctxt)
 	writeProducerSec(ctxt)
 	if !*ld.FlagS {
 		writeNameSec(ctxt, len(hostImports), fns)
 	}
+}
+
+// our fips hash needs to be of the view of the linear memory, not the finally
+// assembled data section. wasmSectionReader presents a ReaderAt of our linear
+// memory view.
+type sectionReader struct {
+	sections []wasmDataSect
+}
+
+func newSectionReader(s []wasmDataSect) *sectionReader {
+	sec := slices.Clone(s)
+	slices.SortFunc(sec, func(a, b wasmDataSect) int {
+		return cmp.Compare(a.vaddr, b.vaddr)
+	})
+	return &sectionReader{sec}
+}
+
+func (s *sectionReader) ReadAt(p []byte, off int64) (n int, err error) {
+	i, found := slices.BinarySearchFunc(s.sections, off, func(d wasmDataSect, t int64) int {
+		if d.vaddr+uint64(len(d.data)) < uint64(t) {
+			return -1
+		}
+		if uint64(t) < d.vaddr {
+			return 1
+		}
+		return 0
+	})
+	// offset is outside any of our sections.
+	// return zeroes.
+	if !found {
+		if i == len(s.sections) {
+			clear(p)
+			return len(p), nil
+		}
+		do := s.sections[i]
+		// logical number of zeroes until next section
+		numZeroes := do.vaddr - uint64(off)
+		n = int(min(numZeroes, uint64(len(p))))
+		clear(p[:n])
+		return n, nil
+	}
+	do := s.sections[i]
+	start := uint64(off) - do.vaddr
+	data := do.data[start:]
+	n = copy(p[:], data)
+	// read at the absolute end of this section
+	// return zeroes instead.
+	if n == 0 {
+		clear(p[:])
+		return len(p), nil
+	}
+	return n, nil
+}
+
+func asmbfips(ctxt *ld.Link, ldr *loader.Loader, textbegin int64, textend int64) {
+
+	// don't bother making the hash if we don't have any fips text.
+	if textbegin == -1 {
+		return
+	}
+	dataReader := newSectionReader(dataSects)
+	secs := make([]*ld.FipsSection, 0, len(ld.FIPSSyms)/2)
+	for i := 0; i < len(ld.FIPSSyms); i += 2 {
+		start := &ld.FIPSSyms[i]
+		end := &ld.FIPSSyms[i+1]
+		startAddr := ldr.SymValue(start.Sym)
+		endAddr := ldr.SymValue(end.Sym)
+		sectRd := dataReader
+		if start.Name == "go:textfipsstart" {
+			// instead of reading out the dataSections,
+			// read out of the file on disk
+			sectRd = &sectionReader{
+				sections: []wasmDataSect{{
+					vaddr: uint64(startAddr),
+					data:  ctxt.Out.Data()[textbegin:textend],
+				}},
+			}
+		}
+		secs = append(secs, &ld.FipsSection{
+			Section: sectRd,
+			Start:   startAddr,
+			End:     endAddr,
+		})
+	}
+	sum, err := ld.FipsSum(secs, *ld.FlagFipso)
+	if err != nil {
+		return
+	}
+	fipsinfo := ldr.Lookup("go:fipsinfo", 0)
+	symb := ldr.MakeSymbolUpdater(fipsinfo)
+	symb.SetBytesAt(ld.FIPSMagicLen, sum)
+	sect := ldr.SymSect(fipsinfo)
+	data := ld.DatblkBytes(ctxt, int64(sect.Vaddr), int64(sect.Length))
+	dataSects = append(dataSects, wasmDataSect{sect.Vaddr, data})
 }
 
 func lookupType(sig *wasmFuncType, types *[]*wasmFuncType) uint32 {
@@ -496,16 +596,27 @@ func writeElementSec(ctxt *ld.Link, numImports, numFns uint64) {
 
 // writeCodeSec writes the section that provides the function bodies for the functions
 // declared by the "func" section.
-func writeCodeSec(ctxt *ld.Link, fns []*wasmFunc) {
+// It returns the offset in ctxt.Data() in which the FIPS140 hash-validated
+// symbols begin and end, or (-1,-1) if no fips symbols exist.
+func writeCodeSec(ctxt *ld.Link, fns []*wasmFunc) (begin int64, end int64) {
 	sizeOffset := writeSecHeader(ctxt, sectionCode)
 
 	writeUleb128(ctxt.Out, uint64(len(fns))) // number of code entries
+	begin = -1
+	end = -1
 	for _, fn := range fns {
+		if begin == -1 && fn.isFips140 {
+			begin = ctxt.Out.Offset()
+		}
 		writeUleb128(ctxt.Out, uint64(len(fn.Code)))
 		ctxt.Out.Write(fn.Code)
+		if begin != -1 && fn.isFips140 {
+			end = ctxt.Out.Offset()
+		}
 	}
 
 	writeSecSize(ctxt, sizeOffset)
+	return begin, end
 }
 
 // writeDataSec writes the section that provides data that will be used to initialize the linear memory.
@@ -528,7 +639,7 @@ func writeDataSec(ctxt *ld.Link) {
 	var segments []*dataSegment
 	for secIndex, ds := range dataSects {
 		data := ds.data
-		offset := int32(ds.sect.Vaddr)
+		offset := int32(ds.vaddr)
 
 		// skip leading zeroes
 		for len(data) > 0 && data[0] == 0 {
@@ -578,6 +689,36 @@ func writeDataSec(ctxt *ld.Link) {
 		writeUleb128(ctxt.Out, uint64(len(seg.data)))
 		ctxt.Out.Write(seg.data)
 	}
+
+	writeSecSize(ctxt, sizeOffset)
+}
+
+func writeFipsSection(ctxt *ld.Link, ldr *loader.Loader, begin int64, end int64) {
+	// don't bother writing a FIPS140-3 section if we're not doing a GOFIPS140
+	// build. Note that we still construct the full proper hash of the text
+	// section for the fipsinfo struct earlier during linking. This ensures that
+	// if some user doesn't build with GOFIPS140 but later turns it on via
+	// GODEBUG, the POST will fail like it's supposed to
+	if begin == -1 || *ld.FlagFipso == "" {
+		return
+	}
+	sizeOffset := writeSecHeader(ctxt, sectionCustom)
+	// fipsrelocinfo contains the necessary information for the loader script
+	// (usually $GOROOT/lib/wasm/go_js_wasm_exec) to fill the fips text buffer
+	// with the text section that needs to be verified by the fips loader module.
+	// The webassembly instantiator only sees this as an array of bytes, so we get
+	// to choose any format we want.
+	writeName(ctxt.Out, "fipsrelocinfo")
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], uint64(begin))
+	ctxt.Out.Write(tmp[:])
+
+	bufAddr := ldr.SymAddr(ld.FipsTextBuffer)
+	binary.LittleEndian.PutUint64(tmp[:], uint64(bufAddr))
+	ctxt.Out.Write(tmp[:])
+
+	binary.LittleEndian.PutUint64(tmp[:], uint64(end-begin))
+	ctxt.Out.Write(tmp[:])
 
 	writeSecSize(ctxt, sizeOffset)
 }

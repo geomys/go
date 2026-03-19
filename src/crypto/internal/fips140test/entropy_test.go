@@ -32,6 +32,9 @@ var flagNISTSP80090B = flag.Bool("nist-sp800-90b", false, "run NIST SP 800-90B t
 
 func TestEntropySamples(t *testing.T) {
 	cryptotest.MustSupportFIPS140(t)
+	if runtime.GOARCH == "wasm" {
+		t.Skip("the internal Entropy Source does not work on wasm")
+	}
 	now := time.Now().UTC()
 
 	seqSampleCount := 1_000_000

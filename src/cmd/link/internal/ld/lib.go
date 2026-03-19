@@ -2148,7 +2148,7 @@ func (ctxt *Link) hostlink() {
 				return machoRewriteUuid(ctxt, exef, exem, outexe)
 			})
 	}
-	hostlinkfips(ctxt, *flagOutfile, *flagFipso)
+	hostlinkfips(ctxt, *flagOutfile, *FlagFipso)
 	if ctxt.NeedCodeSign() {
 		err := machoCodeSign(ctxt, *flagOutfile)
 		if err != nil {

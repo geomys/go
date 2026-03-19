@@ -176,11 +176,6 @@ func SetFIPSDebugHash(pattern string) {
 // EnableFIPS reports whether FIPS should be enabled at all
 // on the current buildcfg GOOS and GOARCH.
 func EnableFIPS() bool {
-	// WASM is out of scope; its binaries are too weird.
-	// I'm not even sure it can read its own code.
-	if buildcfg.GOARCH == "wasm" {
-		return false
-	}
 
 	// CL 214397 added -buildmode=pie to windows-386
 	// and made it the default, but the implementation is
