@@ -3101,6 +3101,12 @@ func (ctxt *Link) address() []*sym.Segment {
 	ctxt.xdefine("runtime.ecovctrs", sym.SCOVERAGE_COUNTER, int64(noptrbss.Vaddr+covCounterDataStartOff+covCounterDataLen))
 	ctxt.xdefine("runtime.end", sym.SBSS, int64(Segdata.Vaddr+Segdata.Length))
 
+	if ctxt.IsWasm() {
+		startSym := ldr.Lookup("go:textfipsstart", 0)
+		addr := ldr.SymAddr(startSym)
+		ctxt.xdefine("go:textfipsend", sym.SNOPTRBSS, int64(addr+ldr.SymSize(startSym)))
+	}
+
 	if fuzzCounters != nil {
 		if *flagAsan {
 			// ASAN requires that the symbol marking the end

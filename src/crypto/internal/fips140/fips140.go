@@ -28,6 +28,11 @@ func init() {
 	}
 }
 
+// fips140wasmentropy explicitly bypasses the internal Entropy Source on Wasm,
+// which is not yet working. This is not intended for production use. See
+// [crypto/internal/fips140/drbg.getEntropy].
+var fips140wasmentropy = godebug.New("#fips140wasmentropy")
+
 // Supported returns an error if FIPS 140-3 mode can't be enabled.
 func Supported() error {
 	// Keep this in sync with fipsSupported in cmd/dist/test.go.
@@ -51,7 +56,7 @@ func Supported() error {
 	// Also, js/wasm and windows/386 don't have good enough timers
 	// for the CPU jitter entropy source.
 	switch {
-	case runtime.GOARCH == "wasm",
+	case runtime.GOARCH == "wasm" && (runtime.GOOS != "js" || fips140wasmentropy.Value() != "bypass"),
 		runtime.GOOS == "windows" && runtime.GOARCH == "386",
 		runtime.GOOS == "openbsd", // due to -fexecute-only, see #70880
 		runtime.GOOS == "aix":
