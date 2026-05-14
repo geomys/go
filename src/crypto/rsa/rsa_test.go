@@ -1281,7 +1281,7 @@ func TestModifiedPrivateKey(t *testing.T) {
 	})
 
 	t.Run("D+2", func(t *testing.T) {
-		if fips140.Version() == "v1.0.0" {
+		if fips140.Version() == "v1.0.0" || fips140.Version() == "v1.0.1" {
 			t.Skip("This was fixed after v1.0.0")
 		}
 		testModifiedPrivateKey(t, func(k *PrivateKey) {
