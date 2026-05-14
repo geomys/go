@@ -1852,8 +1852,9 @@ func (t *tester) fipsSupported(version string) bool {
 	}
 
 	switch {
-	// wasm/js partially works on latest with GODEBUG=fips140wasmentropy=bypass.
-	case goarch == "wasm" && (goos != "js" || version != "latest"),
+	// wasm/js partially works on latest with GODEBUG=fips140wasmentropy=bypass,
+	// and works on v1.0.1.
+	case goarch == "wasm" && (goos != "js" || version != "latest" && version != "v1.0.1"),
 		goos == "windows" && goarch == "386",
 		goos == "openbsd",
 		goos == "aix":

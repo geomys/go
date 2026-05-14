@@ -295,7 +295,7 @@ bXVL8iKLrG91IYQByUHZIn3WVAd2bfi4MfKagRt0ggd4
 			expectNoErr(t, err)
 			expectNoErr(t, errRet2(kem.NewPrivateKey(kb)))
 			expectNoErr(t, errRet2(kem.NewPublicKey(k.PublicKey().Bytes())))
-			if fips140.Version() == "v1.0.0" {
+			if fips140.Version() == "v1.0.0" || fips140.Version() == "v1.0.1" {
 				t.Skip("FIPS 140-3 Module v1.0.0 does not provide HPKE GCM modes")
 			}
 			c, err := hpke.Seal(k.PublicKey(), hpke.HKDFSHA256(), hpke.AES128GCM(), nil, nil)

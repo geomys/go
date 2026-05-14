@@ -65,7 +65,7 @@ var allCASTs = []string{
 }
 
 func init() {
-	if fips140.Version() == "v1.0.0" {
+	if fips140.Version() == "v1.0.0" || fips140.Version() == "v1.0.1" {
 		allCASTs = slices.DeleteFunc(allCASTs, func(s string) bool {
 			return strings.HasPrefix(s, "ML-DSA")
 		})
