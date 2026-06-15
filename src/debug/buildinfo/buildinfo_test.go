@@ -40,8 +40,10 @@ func TestReadFile(t *testing.T) {
 		{"aix", "ppc64"},
 		{"darwin", "amd64"},
 		{"darwin", "arm64"},
+		{"js", "wasm"},
 		{"linux", "386"},
 		{"linux", "amd64"},
+		{"wasip1", "wasm"},
 		{"windows", "386"},
 		{"windows", "amd64"},
 	}
@@ -144,7 +146,37 @@ func TestReadFile(t *testing.T) {
 		if i < 0 {
 			t.Fatal("Go buildinf not found")
 		}
+		// The version string length varint immediately follows the 32-byte
+		// header. On most platforms the blob is contiguous in the file, so the
+		// length is at i+32.
 		verLen := data[i+32:]
+		if bytes.HasPrefix(data, []byte("\x00asm")) {
+			// On wasm the linker stores linear memory as data segments and
+			// omits runs of zero bytes, so the 16 unused bytes in the upper
+			// half of the header are elided: the first 16 header bytes are one
+			// segment and the version string length begins the data of the
+			// next. Skip that segment's 16 bytes and the next segment's framing
+			// (mode, i32.const offset expression, and byte count) to find it.
+			p := i + 16
+			skipLEB := func() {
+				for data[p]&0x80 != 0 {
+					p++
+				}
+				p++
+			}
+			skipLEB() // segment mode
+			if data[p] != 0x41 {
+				t.Fatalf("expected i32.const opcode, got %#x", data[p])
+			}
+			p++
+			skipLEB() // i32.const offset (signed LEB128)
+			if data[p] != 0x0b {
+				t.Fatalf("expected end opcode, got %#x", data[p])
+			}
+			p++
+			skipLEB() // segment byte count
+			verLen = data[p:]
+		}
 		binary.PutUvarint(verLen, 16<<40) // 16TB ought to be enough for anyone.
 		if err := os.WriteFile(name, data, 0666); err != nil {
 			t.Fatal(err)
