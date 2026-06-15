@@ -140,7 +140,7 @@ func isGoBinaryCandidate(file string, info fs.FileInfo) bool {
 	}
 	name := strings.ToLower(file)
 	switch filepath.Ext(name) {
-	case ".so", ".exe", ".dll":
+	case ".so", ".exe", ".dll", ".wasm":
 		return true
 	default:
 		return strings.Contains(name, ".so.")
