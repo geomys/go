@@ -2221,3 +2221,32 @@ func TestModuledataPlacement(t *testing.T) {
 		// so there is nothing to test here.
 	}
 }
+
+// TestWasmBuildInfo checks that the linker writes the build info into the data
+// section of a wasm binary, so that go version and debug/buildinfo can read it.
+// See issue 73741. Reading it back is tested in debug/buildinfo.
+func TestWasmBuildInfo(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	t.Parallel()
+
+	tmpdir := t.TempDir()
+	src := filepath.Join(tmpdir, "hello.go")
+	if err := os.WriteFile(src, []byte("package main\nfunc main() {}\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(tmpdir, "hello.wasm")
+
+	cmd := goCmd(t, "build", "-o", exe, src)
+	cmd.Env = append(cmd.Env, "GOOS=js", "GOARCH=wasm")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("\xff Go buildinf:")) {
+		t.Error("wasm binary does not contain the build info magic")
+	}
+}
