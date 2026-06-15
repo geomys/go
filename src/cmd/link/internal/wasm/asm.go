@@ -129,6 +129,7 @@ func asmb(ctxt *ld.Link, ldr *loader.Loader) {
 		ldr.SymSect(ldr.Lookup("runtime.itablink", 0)),
 		ldr.SymSect(ldr.Lookup("runtime.firstmoduledata", 0)),
 		ldr.SymSect(ldr.Lookup("runtime.pclntab", 0)),
+		ldr.SymSect(ldr.Lookup("go:buildinfo", 0)),
 		ldr.SymSect(ldr.Lookup("runtime.noptrdata", 0)),
 		ldr.SymSect(ldr.Lookup("runtime.data", 0)),
 	}
