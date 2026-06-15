@@ -146,6 +146,12 @@ func readRawBuildInfo(r io.ReaderAt) (vers, mod string, err error) {
 			return "", "", errUnrecognizedFormat
 		}
 		x = &machoExe{f.Arches[0].File}
+	case bytes.HasPrefix(ident, []byte("\x00asm")):
+		f, err := newWasmExe(r)
+		if err != nil {
+			return "", "", errUnrecognizedFormat
+		}
+		x = f
 	case bytes.HasPrefix(ident, []byte{0x01, 0xDF}) || bytes.HasPrefix(ident, []byte{0x01, 0xF7}):
 		f, err := xcoff.NewFile(r)
 		if err != nil {
@@ -596,4 +602,280 @@ func (x *plan9objExe) DataReader(addr uint64) (io.ReaderAt, error) {
 		}
 	}
 	return nil, errors.New("address not mapped")
+}
+
+// wasmExe is the WebAssembly implementation of the exe interface.
+//
+// A WebAssembly binary has no sections mapped at virtual addresses. Instead,
+// the data used to initialize linear memory is stored in the data section as a
+// list of segments, each placed at a constant offset in linear memory. The
+// build info blob begins a 16-byte-aligned segment, but the linker omits runs
+// of zero bytes (see cmd/link/internal/wasm.writeDataSec), so the blob is split
+// across segments, including across the unused, elided upper half of its
+// header.
+//
+// newWasmExe finds the blob and reconstructs a contiguous copy of linear memory
+// from it onward, filling the gaps with zeros, so that DataStart and DataReader
+// can serve the shared scanning and decoding code from a plain byte slice. The
+// reconstruction is bounded to wasmBuildInfoLimit, and segment contents are
+// streamed straight from the file, so memory use stays bounded regardless of
+// the size of the binary.
+type wasmExe struct {
+	base uint64 // linear-memory address of data
+	data []byte
+}
+
+const (
+	// wasmDataSectionID is the section ID of the data section in a WebAssembly
+	// binary. See https://webassembly.github.io/spec/core/binary/modules.html#sections.
+	wasmDataSectionID = 11
+
+	// wasmBuildInfoLimit bounds how much linear memory is reconstructed when
+	// reading the build info, so segments at distant offsets cannot force a
+	// huge allocation. The blob lies at the start of the reconstructed range,
+	// and the build info is far smaller than this in practice.
+	wasmBuildInfoLimit = 16 << 20
+)
+
+func newWasmExe(r io.ReaderAt) (*wasmExe, error) {
+	// Find where the build info blob begins, and the highest address reached by
+	// any data segment. The blob begins a 16-byte-aligned segment, so this only
+	// reads the leading bytes of each segment and retains no segment contents.
+	base, maxAddr, found, err := scanWasmBuildInfo(r)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the blob is absent, return an empty exe so that DataStart reports no
+	// data and the file is reported as a valid non-Go binary rather than an
+	// unrecognized one.
+	x := &wasmExe{}
+	if !found {
+		return x, nil
+	}
+
+	// Reconstruct linear memory from the blob onward, filling the gaps between
+	// segments with zeros (in particular the elided upper half of the header),
+	// up to the limit. Each segment's overlapping bytes are read straight into
+	// the reconstruction, so no more than wasmBuildInfoLimit is held at once.
+	end := maxAddr
+	if end-base > wasmBuildInfoLimit {
+		end = base + wasmBuildInfoLimit
+	}
+	data := make([]byte, end-base)
+	err = walkWasmDataSegments(r, func(offset, size uint64, pos int64) error {
+		segEnd := offset + size
+		if offset >= end || segEnd <= base {
+			return nil
+		}
+		lo, hi := max(offset, base), min(segEnd, end)
+		if n, _ := r.ReadAt(data[lo-base:hi-base], pos+int64(lo-offset)); uint64(n) < hi-lo {
+			return errUnrecognizedFormat // segment extends past the file
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	x.base = base
+	x.data = data
+	return x, nil
+}
+
+// scanWasmBuildInfo walks the data segments and returns the lowest
+// 16-byte-aligned linear-memory address at which a segment begins with the
+// build info magic, along with the highest address reached by any segment.
+// found is false if no segment begins with the magic.
+func scanWasmBuildInfo(r io.ReaderAt) (base, maxAddr uint64, found bool, err error) {
+	magic := make([]byte, len(buildInfoMagic))
+	err = walkWasmDataSegments(r, func(offset, size uint64, pos int64) error {
+		if e := offset + size; e > maxAddr {
+			maxAddr = e
+		}
+		// The blob begins a 16-byte-aligned segment with the magic. Skip any
+		// segment that cannot be the lowest such one, so we read no more than
+		// necessary.
+		if offset%buildInfoAlign != 0 || size < uint64(len(magic)) {
+			return nil
+		}
+		if found && offset >= base {
+			return nil
+		}
+		if n, _ := r.ReadAt(magic, pos); n < len(magic) {
+			return errUnrecognizedFormat // segment extends past the file
+		}
+		if bytes.Equal(magic, buildInfoMagic) {
+			base, found = offset, true
+		}
+		return nil
+	})
+	return base, maxAddr, found, err
+}
+
+// walkWasmDataSegments calls fn for each non-empty active data segment in the
+// module, passing the segment's linear-memory offset, its size in bytes, and
+// the file position of its data. The Go linker emits only mode 0 (active,
+// memory 0) segments; the walk stops at the first segment of any other kind,
+// since the file is then a valid non-Go binary.
+func walkWasmDataSegments(r io.ReaderAt, fn func(offset, size uint64, pos int64) error) error {
+	// A module starts with the magic "\0asm" followed by the version as a
+	// little-endian uint32.
+	var hdr [8]byte
+	if n, _ := r.ReadAt(hdr[:], 0); n < len(hdr) {
+		return errUnrecognizedFormat
+	}
+	if string(hdr[:4]) != "\x00asm" || binary.LittleEndian.Uint32(hdr[4:]) != 1 {
+		return errUnrecognizedFormat
+	}
+
+	// A module is a sequence of sections, each a one-byte ID, a LEB128 length,
+	// and that many content bytes. Walk them, descending into data sections.
+	w := wasmReader{r: r, pos: int64(len(hdr))}
+	for {
+		id, ok := w.readByte()
+		if !ok {
+			return nil // end of module
+		}
+		size, ok := w.readUint()
+		if !ok {
+			return errUnrecognizedFormat
+		}
+		end := w.pos + int64(size)
+		if end < w.pos {
+			return errUnrecognizedFormat // overflow
+		}
+		if id == wasmDataSectionID {
+			if err := walkWasmDataSection(&w, end, fn); err != nil {
+				return err
+			}
+		}
+		w.pos = end
+	}
+}
+
+// walkWasmDataSection walks the segments of one data section, whose content
+// ends at the file position end, calling fn for each non-empty segment.
+func walkWasmDataSection(w *wasmReader, end int64, fn func(offset, size uint64, pos int64) error) error {
+	count, ok := w.readUint()
+	if !ok {
+		return errUnrecognizedFormat
+	}
+	for i := uint64(0); i < count; i++ {
+		// Each segment begins with a mode (see the data segment grammar at
+		// https://webassembly.github.io/spec/core/binary/modules.html#data-section).
+		// The Go linker emits only mode 0: active, memory 0, with an i32.const
+		// offset expression followed by the bytes. Reject anything else.
+		mode, ok := w.readUint()
+		if !ok {
+			return errUnrecognizedFormat
+		}
+		if mode != 0 {
+			// The Go linker emits only mode 0 (active, memory 0) segments. A
+			// different segment kind is valid wasm, just not something Go
+			// produces, and we can't parse past it without decoding its body.
+			// Stop here: the file is reported as a valid non-Go binary (via the
+			// empty result) rather than an unrecognized one. This is the last
+			// data section, so nothing further is skipped.
+			return nil
+		}
+		offset, ok := w.readOffsetExpr()
+		if !ok {
+			return errUnrecognizedFormat
+		}
+		size, ok := w.readUint()
+		if !ok || w.pos > end || size > uint64(end-w.pos) {
+			return errUnrecognizedFormat
+		}
+		if size > 0 {
+			if err := fn(offset, size, w.pos); err != nil {
+				return err
+			}
+		}
+		w.pos += int64(size)
+	}
+	return nil
+}
+
+func (x *wasmExe) DataStart() (uint64, uint64) {
+	return x.base, uint64(len(x.data))
+}
+
+func (x *wasmExe) DataReader(addr uint64) (io.ReaderAt, error) {
+	if addr < x.base || addr-x.base > uint64(len(x.data)) {
+		return nil, errNotGoExe
+	}
+	return bytes.NewReader(x.data[addr-x.base:]), nil
+}
+
+// wasmReader reads a WebAssembly binary sequentially through an io.ReaderAt.
+type wasmReader struct {
+	r   io.ReaderAt
+	pos int64
+}
+
+func (w *wasmReader) readByte() (byte, bool) {
+	var b [1]byte
+	if n, _ := w.r.ReadAt(b[:], w.pos); n < 1 {
+		return 0, false
+	}
+	w.pos++
+	return b[0], true
+}
+
+// readUint reads an unsigned LEB128 integer.
+func (w *wasmReader) readUint() (uint64, bool) {
+	var result uint64
+	for shift := uint(0); ; shift += 7 {
+		if shift >= 64 {
+			return 0, false // too many bytes
+		}
+		b, ok := w.readByte()
+		if !ok {
+			return 0, false
+		}
+		result |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			return result, true
+		}
+	}
+}
+
+// readInt reads a signed LEB128 integer.
+func (w *wasmReader) readInt() (int64, bool) {
+	var result int64
+	var shift uint
+	for {
+		b, ok := w.readByte()
+		if !ok {
+			return 0, false
+		}
+		result |= int64(b&0x7f) << shift
+		shift += 7
+		if b&0x80 == 0 {
+			if shift < 64 && b&0x40 != 0 {
+				result |= -1 << shift // sign extend
+			}
+			return result, true
+		}
+		if shift >= 64 {
+			return 0, false // too many bytes
+		}
+	}
+}
+
+// readOffsetExpr reads a constant offset expression of the form
+// "i32.const <value> end" and returns the value as a linear-memory offset.
+func (w *wasmReader) readOffsetExpr() (uint64, bool) {
+	if op, ok := w.readByte(); !ok || op != 0x41 { // i32.const
+		return 0, false
+	}
+	v, ok := w.readInt()
+	if !ok {
+		return 0, false
+	}
+	if op, ok := w.readByte(); !ok || op != 0x0b { // end
+		return 0, false
+	}
+	// i32.const holds a 32-bit value, used here as an unsigned address.
+	return uint64(uint32(v)), true
 }
