@@ -1,0 +1,143 @@
+name: Wasm FIPS 140-3 procedure
+
+on:
+  push:
+    branches: [fips140-wasm, fips140-wasm-next]
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this branch
+        uses: actions/checkout@v4
+        with:
+          path: go-wasm-fips140
+
+      - name: Install a bootstrap toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Compile the Go toolchain
+        working-directory: go-wasm-fips140/src
+        run: |
+          ./make.bash
+
+      - name: Create a working directory for the example
+        run: mkdir -p example
+
+      - name: Build the Wasm module
+        working-directory: example
+        run: |
+          GOROOT="$GITHUB_WORKSPACE/go-wasm-fips140"
+
+          # Create an example Go program.
+          cat > main.go <<'EOF'
+          package main
+          import (
+          	"crypto"
+          	"crypto/ecdsa"
+          	"crypto/elliptic"
+          	"crypto/fips140"
+          	"crypto/sha256"
+          	"fmt"
+          )
+          func main() {
+          	fmt.Printf("FIPS 140-3 mode enabled: %t\n", fips140.Enabled())
+          	fmt.Printf("FIPS 140-3 module version: %s\n", fips140.Version())
+          	key, err := ecdsa.GenerateKey(elliptic.P256(), nil)
+          	if err != nil {
+          		fmt.Printf("Error generating ECDSA key: %v\n", err)
+          		return
+          	}
+          	message := sha256.Sum256([]byte("Hello, FIPS 140-3!"))
+          	sig, err := key.Sign(nil, message[:], crypto.SHA256)
+          	if err != nil {
+          		fmt.Printf("Error signing message: %v\n", err)
+          		return
+          	}
+          	fmt.Printf("Signature generated successfully: %x\n", sig)
+          }
+          EOF
+
+          # Build the Wasm module.
+          GOFIPS140=v1.0.1 GOOS=js GOARCH=wasm "$GOROOT/bin/go" build -o main.wasm main.go
+
+          # Copy module instantiation JavaScript.
+          cp "$GOROOT/lib/wasm/wasm_exec.js" .
+
+          # Create an HTML page to load the Wasm module.
+          cat > index.html <<'EOF'
+          <!doctype html>
+          <html>
+          <head>
+          <meta charset="utf-8">
+          <script src="wasm_exec.js"></script>
+          <script type="module">
+          const go = new Go();
+          const source = await (await fetch("main.wasm")).arrayBuffer();
+          const result = await WebAssembly.instantiate(source, go.importObject);
+          await go.run(result.instance, result.module, source);
+          </script>
+          EOF
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install browser test dependencies
+        working-directory: example
+        run: |
+          npm init -y >/dev/null
+          npm install playwright http-server
+          npx playwright install --with-deps chromium
+
+      - name: Serve the module and check the console output
+        working-directory: example
+        run: |
+          # Load index.html in a headless browser and assert the program runs in
+          # FIPS 140-3 mode and produces a signature.
+          cat > check.mjs <<'EOF'
+          import { chromium } from "playwright";
+
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          const logs = [];
+          page.on("console", (msg) => {
+            logs.push(msg.text());
+            console.log("[console]", msg.text());
+          });
+          page.on("pageerror", (err) => console.error("[pageerror]", err));
+
+          await page.goto("http://localhost:8080/", { waitUntil: "load" });
+
+          const deadline = Date.now() + 15000;
+          while (
+            Date.now() < deadline &&
+            !logs.some((l) => l.includes("Signature generated successfully:"))
+          ) {
+            await page.waitForTimeout(200);
+          }
+          await browser.close();
+
+          const output = logs.join("\n");
+          const require = (needle) => {
+            if (!output.includes(needle)) {
+              console.error(`missing expected output: ${JSON.stringify(needle)}`);
+              process.exit(1);
+            }
+          };
+          require("FIPS 140-3 mode enabled: true");
+          require("FIPS 140-3 module version: v1.0.1");
+          require("Signature generated successfully:");
+          console.log("OK: Wasm module ran in FIPS 140-3 mode");
+          EOF
+
+          npx http-server -p 8080 -g > http-server.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/ >/dev/null && break
+            sleep 0.5
+          done
+
+          node check.mjs
